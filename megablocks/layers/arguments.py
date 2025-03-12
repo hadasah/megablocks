@@ -30,13 +30,16 @@ class Arguments:
     activation_fn: Optional[Callable] = DEFAULT_ACTIVATION_FN
 
     # MoE arguments.
-    moe_num_experts: int = 1
-    moe_top_k: int = 1
-    moe_capacity_factor: int = 1
-    moe_normalize_expert_weights: Optional[Union[int, float]] = None
-    moe_loss_weight: float = 0.1
-    moe_jitter_eps: Optional[float] = None
-    moe_lbl_in_fp32: bool = False
+    moe_num_experts : int = 1
+    moe_top_k : int = 1
+    moe_capacity_factor : int = 1
+    moe_normalize_expert_weights : Optional[Union[int, float]] = None
+    moe_loss_weight : float = 0.1
+    moe_zloss_weight : float = 0.001
+    moe_jitter_eps : Optional[float] = None
+    moe_lbl_in_fp32 : bool = False
+    moe_expert_choice: bool = False
+    moe_expert_choice_grouped: bool = False
 
     # Parallelism arguments.
     moe_expert_model_parallelism: bool = False

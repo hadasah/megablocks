@@ -35,8 +35,10 @@ def batched_load_balancing_loss(args: Arguments):
 
     # tokens_per_expert[i].shape = (num_experts)
     # expert_scores[i].shape = (tokens, num_experts)
-    tokens_per_expert, expert_scores = zip(*get_load_balancing_loss())
-    num_layers_per_pipeline_stage = (args.num_layers // args.pipeline_model_parallel_size)
+    # tokens_per_expert, expert_scores = zip(*get_load_balancing_loss())
+    tokens_per_expert, expert_scores, expert_logits = zip(*get_load_balancing_loss())
+    num_layers_per_pipeline_stage = (
+        args.num_layers // args.pipeline_model_parallel_size)
     if args.num_layers_per_virtual_pipeline_stage is not None:
         num_layers_per_pipeline_stage = args.num_layers_per_virtual_pipeline_stage
 
@@ -75,6 +77,7 @@ def batched_load_balancing_loss(args: Arguments):
     else:
         expert_scores = expert_scores.sum(dim=0)
     tokens_per_expert = torch.cat(tokens_per_expert).to(expert_scores.dtype)
+    expert_logits = torch.cat(expert_logits, dim=0).to(expert_scores.dtype)
 
     expected_values = num_layers_per_pipeline_stage * args.moe_num_experts
     assert tokens_per_expert.numel() == expected_values
@@ -86,7 +89,8 @@ def batched_load_balancing_loss(args: Arguments):
     scale_numerator = (args.moe_num_experts * args.moe_loss_weight)
     scale_denominator = (args.num_layers * tokens * args.moe_top_k)
     scale = scale_numerator / scale_denominator
-    return scale * torch.dot(tokens_per_expert, expert_scores)
+    zloss = (torch.log(torch.exp(expert_logits).sum(dim=-1)) ** 2).sum() / scale_denominator
+    return scale * torch.dot(tokens_per_expert, expert_scores), args.moe_zloss_weight * zloss    
 
 
 # NOTE: This class defines MoE expert computation, including expert model parallel
@@ -128,7 +132,14 @@ class ParallelMLP(torch.nn.Module):
             self.register_parameter('bias', None)
 
         # Select the forward function for the operating mode.
-        self.forward_fn = (self.parallel_forward_once if args.moe_expert_model_parallelism else self.forward_once)
+        if self.args.moe_expert_choice_grouped:
+            self.forward = self.forward_ec_grouped
+        if self.args.moe_expert_choice:
+            self.forward = self.forward_ec
+        elif args.moe_expert_model_parallelism:
+            self.forward_fn = self.parallel_forward_once
+        else:
+            self.forward_fn = self.forward_once
 
     def expert_capacity(self, tokens: int) -> int:
         world_size = mpu.get_expert_parallel_world_size(self.args)
@@ -157,20 +168,28 @@ class ParallelMLP(torch.nn.Module):
         # TODO(tgale): Is it worth doing this conversion to 32-bit
         # prior? Could we place the `torch.max` operation to return
         # 32-bit expert indices?
+
+        # bin_ids is sorted list of expert ids
+        # e.g. if top_expert is [0,1,0] bin_ids is [0,0,1]
+        # indices is the expert indices of the bin_ids 
+        # e.g. for the above it'd be [0,2,1]
+        # Both are of shape [sl * bs * topk]  
         top_expert = top_expert.int()
         output = ops.sort(top_expert, self.sort_end_bit)
         assert output is not None
         bin_ids, indices = output
-
         # Histogram the expert ids to identify the number of
         # tokens routed to each expert.
         #
         # TODO(tgale): Does the sorted data produce a more favorable
         # data distribution for histogram? Or is the op parallelism
         # worth more?
+        # tokens_per_expert is the number of tokens assigned to each expert
+        # shape [num_experts] e.g. for the above example it'd be [2,1]
         tokens_per_expert = ops.histogram(top_expert, self.num_experts)
 
         # Calculate the bin bounds for the sorted tokens.
+        # bins becomes the cumulative sum of tokens_per_expert e.g. for above example it'd be [2,3]
         bins = ops.inclusive_cumsum(tokens_per_expert, 0)
         assert bins is not None
         bins = bins.view(1) if not len(bins.size()) else bins
@@ -201,13 +220,14 @@ class ParallelMLP(torch.nn.Module):
 
         # Perform the expert computation. Note that we don't
         # use biases for these linear operations.
+        # mlp.w1.shape: [num_experts, hid_dim, ffn_dim]
         x = self.mlp(x)
 
         # Un-route the data for the MoE output.
         return ops.binned_scatter(x, indices, expert_weights, bins, top_k)
 
     def forward_once(self, x: torch.Tensor, expert_weights: torch.Tensor, top_experts: torch.Tensor):
-        # x: [sl, bs, hs]
+        # x: [bs, sl, hs]
         # expert_weights: [sl * bs, top-k]
         # top_experts: [sl * bs, top-k]
         expert_weights = expert_weights.flatten()
@@ -217,7 +237,7 @@ class ParallelMLP(torch.nn.Module):
 
             # If expert_capacity is set to zero, set the number of tokens
             # per expert to the maximum we need to avoid dropping tokens.
-            sl, bs, _ = x.size()
+            bs, sl, hs = x.size()
             expert_capacity = self.expert_capacity(sl * bs)
             if expert_capacity == 0:
                 expert_capacity = torch.max(tokens_per_expert).item()
@@ -422,13 +442,13 @@ class ParallelMLP(torch.nn.Module):
         x = ops.scatter(x, indices, bin_ids, expert_weights, bins, self.top_k)
         return x, tokens_per_expert.flatten()
 
-    def forward(self, x: torch.Tensor, scores: torch.Tensor, expert_weights: torch.Tensor, top_experts: torch.Tensor):
+    def forward(self, x: torch.Tensor, logits: torch.Tensor, scores: torch.Tensor, expert_weights: torch.Tensor, top_experts: torch.Tensor):
         in_shape = x.size()
 
         # Compute the experts.
         x, tokens_per_expert = self.forward_fn(x, expert_weights, top_experts)
         if self.training and self.args.moe_loss_weight > 0:
-            save_load_balancing_loss((tokens_per_expert, scores))
+            save_load_balancing_loss((tokens_per_expert, scores, logits))
         x = x.view(in_shape)
         if self.bias is not None:
             if self.args.return_bias:
@@ -436,6 +456,47 @@ class ParallelMLP(torch.nn.Module):
             return x + self.bias
         return x
 
+    def forward_ec_grouped(self, x, scores, expert_weights, top_experts):
+        bs, sl, hs = x.shape
+        num_experts, k = expert_weights.shape
+
+        x = x.flatten(start_dim=0, end_dim=1)
+        x = torch.index_select(x, dim=0, index=top_experts.flatten())
+        x = x.reshape((num_experts, k, hs))
+        x = self.mlp(x)
+        x = torch.einsum("ekd,ek->ekd", x, expert_weights)
+        x = x.flatten(start_dim=0, end_dim=1)
+        z = torch.zeros((bs * sl, hs)).type(x.type()).to(x.device)
+        z.index_add_(dim=0, index=top_experts.flatten().to(int), source=x)
+        x = z.reshape((bs, sl, hs))
+        return x
+
+    def forward_ec(self, x, scores, expert_weights, top_experts):
+        """
+        Expert choice forward func
+        sl = sequence length
+        bs = batch size
+        hs = hidden size
+        k = expert capacity
+        Refs:
+        - https://arxiv.org/pdf/2202.09368
+        - https://github.com/google/flaxformer/blob/main/flaxformer/architectures/moe/routing.py#L647-L717
+        - https://github.com/google/flaxformer/blob/399ea3a85e9807ada653fd0de1a9de627eb0acde/flaxformer/architectures/moe/moe_layers.py#L361
+        - https://github.com/microsoft/DeepSpeed/issues/2517
+        """
+        bs, sl, hs = x.shape
+        _, num_experts, k = expert_weights.shape
+        # [bs, num_experts, k, sl]
+        expert_gather_indices = torch.nn.functional.one_hot(top_experts, num_classes=sl).to(x.dtype)
+        # [bs, sl, num_experts, k]
+        expert_gather_indices = torch.moveaxis(expert_gather_indices, 3, 1)
+        x_in = torch.einsum('bs...,bsek->bek...', x, expert_gather_indices)
+        x_in = x_in.permute(1, 0, 2, 3).reshape(num_experts, bs * k, hs)
+        x_e = self.mlp(x_in) # [num_experts, bs*k, d]
+        combine_array = torch.einsum('...ek,...sek->...sek', expert_weights, expert_gather_indices)
+        x_e = x_e.reshape(num_experts, bs, k, hs).permute(1, 0, 2, 3)
+        x_out = torch.einsum('bek...,bsek->bs...', x_e, combine_array)
+        return x_out                
 
 class MoE(torch.nn.Module):
 
@@ -462,10 +523,10 @@ class MoE(torch.nn.Module):
         x = common.cast_if_autocast_enabled(x)
 
         # Compute the expert scores and assignments.
-        scores, expert_weights, top_experts = self.router(x)
+        scores, logits, expert_weights, top_experts = self.router(x)
 
         # Compute the experts.
-        out = self.experts(x, scores, expert_weights, top_experts)
+        out = self.experts(x, scores, logits, expert_weights, top_experts)
         if self.shared_expert is not None:
             shared_expert_out = self.shared_expert(x)
             out = self.shared_expert.add_experts_sharedexpert(
